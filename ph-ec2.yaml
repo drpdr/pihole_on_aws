@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Metadata:
+  License: Apache-2.0
+Description: 'EC2 Instance with Ubuntu Server 20.04 running pi-hole in non-default VPC and Subnet'
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  ClientIP:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  InstanceType:
+    Description: PH EC2 instance type. Free tier t2.micro/t3.micro depending on the region.
+    Type: String
+    # Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro]
+    ConstraintDescription: must be a valid EC2 instance type.
+  LatestAmiId:
+    Type:  'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    # Ubuntu Server 20.04
+    Default: '/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+    # Latest Amazon Linux 2
+    # Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+
+## Boiler plate code to create VPC, IGW, Subnet, RT ...
+########################################################
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: PH VPC
+  # Ipv6CidrBlock:
+  #   Type: AWS::EC2::VPCCidrBlock
+  #   Properties:
+  #     VpcId: !Ref VPC
+  #     AmazonProvidedIpv6CidrBlock: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    # DependsOn: Ipv6CidrBlock
+    Properties:
+      MapPublicIpOnLaunch: true
+      # AssignIpv6AddressOnCreation: true
+      CidrBlock: !Select [ 0, !Cidr [ !GetAtt VPC.CidrBlock, 1, 8 ]]
+      # Ipv6CidrBlock: !Select [ 0, !Cidr [ !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks], 1, 64 ]]
+      VpcId: !Ref VPC
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  InternetRouteV4:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  # InternetRouteV6:
+  #   Type: AWS::EC2::Route
+  #   Properties:
+  #     DestinationIpv6CidrBlock: ::/0
+  #     GatewayId: !Ref InternetGateway
+  #     RouteTableId: !Ref RouteTable
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+
+  ## Security Group to allow SSH access, DNS, and HTTP
+  ## exclusively from your IP
+  #####################################################
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH and PH rules"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: 'Allow SSH IN'
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref ClientIP
+        - Description: 'Allow DNS TCP'
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref ClientIP
+        - Description: 'Allow DNS UDP'
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref ClientIP
+        - Description: 'Allow HTTP TCP'
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref ClientIP
+        - Description: 'Allow HTTP UDP'
+          IpProtocol: udp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref ClientIP
+
+  ### Instance Profile and Instance Role, just in case you cannot use SSH
+  ### https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-configuring-access-role.html
+  ####################################################################################################
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref Ec2InstanceRole ]
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ec2.amazonaws.com ]
+            Action:
+              - sts:AssumeRole
+      Path: /
+
+
+### EC2 Instance with UserData
+##############################
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          ph_install:
+            - setvars
+            - install
+        setvars:
+          files:
+            # https://discourse.pi-hole.net/t/what-is-setupvars-conf-and-how-do-i-use-it/3533/4
+            /etc/pihole/setupVars.conf:
+              content: !Sub |
+                PIHOLE_INTERFACE=ens5
+                PIHOLE_DNS_1=8.8.8.8
+                PIHOLE_DNS_2=8.8.4.4
+                QUERY_LOGGING=true
+                INSTALL_WEB_SERVER=true
+                INSTALL_WEB_INTERFACE=true
+                LIGHTTPD_ENABLED=true
+                CACHE_SIZE=10000
+                BLOCKING_ENABLED=true
+                DNS_FQDN_REQUIRED=true
+                DNS_BOGUS_PRIV=true
+                DNSSEC=true
+                TEMPERATUREUNIT=C
+                WEBUIBOXEDLAYOUT=traditional
+                API_EXCLUDE_DOMAINS=
+                API_EXCLUDE_CLIENTS=
+                API_QUERY_LOG_SHOW=all
+                API_PRIVACY_MODE=false
+                IPV6_ADDRESS=   
+              group: root
+              mode: '000400'
+              owner: root
+          commands:
+            get-ip:
+              command: echo "IPV4_ADDRESS=`curl http://169.254.169.254/latest/meta-data/public-ipv4`" >> /etc/pihole/setupVars.conf
+        install:
+          commands:
+            doit:
+              command: curl -L https://install.pi-hole.net | bash /dev/stdin --unattended 
+
+    Properties:
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      SubnetId: !Ref SubnetA
+      InstanceType: !Ref 'InstanceType'
+      KeyName: !Ref 'KeyName'
+      ImageId: !Ref 'LatestAmiId'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          python3 -m easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+          ln -s /usr/local/bin/cfn-hup /etc/init.d/cfn-hup
+          cfn-init -v --stack ${AWS::StackId} --resource EC2Instance --configsets ph_install --region ${AWS::Region}
+          cfn-signal -e $? --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+
+Outputs:
+  InstanceId:
+    Description: InstanceId of the newly created EC2 instance
+    Value: !Ref 'EC2Instance'
+  PublicDNS:
+    Description: Public DNSName of the newly created EC2 instance
+    Value: !GetAtt [EC2Instance, PublicDnsName]
+  PublicIP:
+    Description: Public IP address of the newly created EC2 instance
+    Value: !GetAtt [EC2Instance, PublicIp]
